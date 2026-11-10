@@ -1,0 +1,109 @@
+# =====================================================================
+#  データ処理基盤 compose スタック（podman compose で実行 / rootful）
+#    postgres        : Hive Metastore のバックエンド DB
+#    s3-init         : Ceph RGW にウェアハウス用バケットを作成（1 回だけ実行）
+#    hive-metastore  : Iceberg カタログ（Thrift :9083）
+#    trino           : SQL エンジン（:8080）
+#  Ceph は cephadm でホスト上に構築済み（RGW = ${S3_ENDPOINT}）
+#  変数は同じディレクトリの .env（Ansible が生成）から読み込まれる
+# =====================================================================
+#  ※ podman は短縮イメージ名を TTY なしで解決できないため、全て完全修飾名で記述
+#  ※ OS 再起動後は podman-restart.service が restart: always のコンテナを起動する
+name: dataplatform
+
+services:
+  postgres:
+    image: docker.io/library/postgres:${POSTGRES_VERSION}
+    container_name: postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  s3-init:
+    image: docker.io/amazon/aws-cli:latest
+    container_name: s3-init
+    restart: "no"
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      AWS_DEFAULT_REGION: ${S3_REGION}
+      # 新しい AWS CLI の既定チェックサム送信を S3 互換ストレージ向けに抑制
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      BUCKET: ${WAREHOUSE_BUCKET}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for i in $$(seq 1 30); do
+          aws --endpoint-url "$$S3_ENDPOINT" s3 ls >/dev/null 2>&1 && break
+          echo "waiting for RGW ($$i)..."; sleep 5
+        done
+        if aws --endpoint-url "$$S3_ENDPOINT" s3api head-bucket --bucket "$$BUCKET" 2>/dev/null; then
+          echo "bucket $$BUCKET already exists"
+        else
+          aws --endpoint-url "$$S3_ENDPOINT" s3api create-bucket --bucket "$$BUCKET"
+          echo "bucket $$BUCKET created"
+        fi
+
+  hive-metastore:
+    image: docker.io/apache/hive:${HIVE_VERSION}
+    container_name: hive-metastore
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      # 独自の hive-site.xml / core-site.xml を /opt/hive/conf にリンクさせる
+      HIVE_CUSTOM_CONF_DIR: /hive_custom_conf
+      SERVICE_OPTS: >-
+        -Xmx1g
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+        -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER}
+        -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./hive/conf:/hive_custom_conf:ro,z
+      # Hive 標準の lib ディレクトリへ JAR を個別にマウント（S3A と PostgreSQL JDBC）
+      - ./hive/lib/postgresql.jar:/opt/hive/lib/postgres.jar:ro,z
+      - ./hive/lib/hadoop-aws.jar:/opt/hive/lib/hadoop-aws.jar:ro,z
+      - ./hive/lib/aws-java-sdk-bundle.jar:/opt/hive/lib/aws-java-sdk-bundle.jar:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  trino:
+    image: docker.io/trinodb/trino:${TRINO_VERSION}
+    container_name: trino
+    restart: always
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    # JVM ヒープはコンテナ上限の 80%（イメージ既定）。Ceph と同居するので上限を設定
+    mem_limit: ${TRINO_MEM_LIMIT}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro,z
+
+volumes:
+  pgdata:

@@ -1,0 +1,9 @@
+# PyIceberg 設定（Ansible が生成）: load_catalog("default") で読み込まれる
+catalog:
+  default:
+    type: hive
+    uri: thrift://127.0.0.1:9083
+    s3.endpoint: http://{{ node_ip }}:{{ rgw_port }}
+    s3.access-key-id: {{ s3_access_key }}
+    s3.secret-access-key: {{ s3_secret_key }}
+    s3.region: {{ s3_region }}

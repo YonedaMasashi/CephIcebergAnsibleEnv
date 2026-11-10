@@ -1,0 +1,11 @@
+service_type: osd
+service_id: lab_osds
+placement:
+  hosts:
+    - {{ ansible_nodename }}
+spec:
+  data_devices:
+    paths:
+{% for dev in osd_devices %}
+      - {{ dev }}
+{% endfor %}

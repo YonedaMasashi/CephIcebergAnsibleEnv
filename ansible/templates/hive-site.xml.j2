@@ -1,0 +1,78 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!-- Hive Metastore (standalone) 設定 : Ansible が生成 -->
+<configuration>
+  <!-- ===== メタデータ DB (PostgreSQL) ===== -->
+  <property>
+    <name>javax.jdo.option.ConnectionDriverName</name>
+    <value>org.postgresql.Driver</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionURL</name>
+    <value>jdbc:postgresql://postgres:5432/{{ postgres_db }}</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionUserName</name>
+    <value>{{ postgres_user }}</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionPassword</name>
+    <value>{{ postgres_password }}</value>
+  </property>
+
+  <!-- ===== ウェアハウス (Ceph RGW のバケット) ===== -->
+  <property>
+    <name>hive.metastore.warehouse.dir</name>
+    <value>s3a://{{ warehouse_bucket }}/</value>
+  </property>
+  <property>
+    <name>hive.metastore.warehouse.external.dir</name>
+    <value>s3a://{{ warehouse_bucket }}/external/</value>
+  </property>
+
+  <!-- ===== Thrift ===== -->
+  <property>
+    <name>hive.metastore.uris</name>
+    <value>thrift://0.0.0.0:9083</value>
+  </property>
+
+  <!-- Iceberg のスキーマ進化（型変更）を HMS 側で拒否しないようにする -->
+  <property>
+    <name>hive.metastore.disallow.incompatible.col.type.changes</name>
+    <value>false</value>
+  </property>
+
+  <!-- ===== S3A → Ceph RGW ===== -->
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>http://{{ node_ip }}:{{ rgw_port }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.endpoint.region</name>
+    <value>{{ s3_region }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.access.key</name>
+    <value>{{ s3_access_key }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.secret.key</name>
+    <value>{{ s3_secret_key }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.ssl.enabled</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>fs.s3a.impl</name>
+    <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+  </property>
+  <property>
+    <name>fs.s3a.aws.credentials.provider</name>
+    <value>org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider</value>
+  </property>
+</configuration>

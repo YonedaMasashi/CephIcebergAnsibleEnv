@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!-- Hadoop FileSystem 用（HMS がディレクトリを作る際に使用）: Ansible が生成 -->
+<configuration>
+  <property>
+    <name>fs.defaultFS</name>
+    <value>s3a://{{ warehouse_bucket }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>http://{{ node_ip }}:{{ rgw_port }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.endpoint.region</name>
+    <value>{{ s3_region }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.access.key</name>
+    <value>{{ s3_access_key }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.secret.key</name>
+    <value>{{ s3_secret_key }}</value>
+  </property>
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.ssl.enabled</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>fs.s3a.impl</name>
+    <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+  </property>
+  <property>
+    <name>fs.s3a.aws.credentials.provider</name>
+    <value>org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider</value>
+  </property>
+</configuration>

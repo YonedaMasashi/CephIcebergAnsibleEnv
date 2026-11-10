@@ -1,0 +1,464 @@
+---
+# =====================================================================
+#  データ処理基盤（検証用・シングルノード）
+#    コンテナランタイム: Podman（rootful）
+#    Ceph (cephadm / RGW=S3)  ← ホストに直接（cephadm が podman で管理）
+#    PostgreSQL + Hive Metastore + Trino  ← podman compose
+#        （podman.socket の Docker 互換 API を docker-compose v2 が叩く）
+#    PyIceberg  ← ホストの Python venv
+#
+#  実行例:
+#    ansible-playbook site.yml -K                 # 全部
+#    ansible-playbook site.yml -K --tags ceph     # Ceph だけ
+#  タグ: base / podman / ceph / stack / pyiceberg / test
+# =====================================================================
+- name: Build data platform (Ceph + Iceberg/HMS + Trino + PyIceberg)
+  hosts: dataplatform
+  become: true
+
+  vars:
+    ceph_shell: "/usr/local/sbin/cephadm shell --"
+    firewall_ports:
+      - "{{ rgw_port }}/tcp"   # Ceph RGW (S3)
+      - "8443/tcp"             # Ceph Dashboard
+      - "8080/tcp"             # Trino
+      - "9083/tcp"             # Hive Metastore (PyIceberg 用)
+    firewall_services:
+      - ceph-mon
+      - ceph
+
+  pre_tasks:
+    - name: 対象 OS の確認
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "RedHat"
+          - ansible_distribution_major_version | int >= 10
+        fail_msg: "Rocky Linux 10 系を想定しています（検出: {{ ansible_distribution }} {{ ansible_distribution_version }}）"
+      tags: [always]
+
+    - name: node_ip がこのマシンに存在するか確認
+      ansible.builtin.assert:
+        that: node_ip in ansible_all_ipv4_addresses
+        fail_msg: "group_vars/all.yml の node_ip={{ node_ip }} がこのマシンの IP ({{ ansible_all_ipv4_addresses }}) にありません"
+      tags: [always]
+
+    - name: OSD 用ディスクの存在確認
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ osd_devices }}"
+      register: osd_dev_stat
+      tags: [ceph]
+
+    - name: OSD 用ディスクがブロックデバイスであること
+      ansible.builtin.assert:
+        that: item.stat.exists and item.stat.isblk
+        fail_msg: "{{ item.item }} が見つかりません。VirtualBox で空ディスクを追加し lsblk で名前を確認してください"
+        quiet: true
+      loop: "{{ osd_dev_stat.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [ceph]
+
+  tasks:
+    # =================================================================
+    # 1. OS 基本設定
+    # =================================================================
+    - name: OS base setup
+      tags: [base]
+      block:
+        - name: 基本パッケージのインストール
+          ansible.builtin.dnf:
+            name:
+              - python3
+              - python3-pip
+              - lvm2
+              - chrony
+              - curl
+              - jq
+              - tar
+              - dnf-plugins-core
+              - openssh-server
+            state: present
+
+        - name: chronyd / sshd を有効化（cephadm は時刻同期と root への SSH を使う）
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            enabled: true
+            state: started
+          loop: [chronyd, sshd]
+
+        - name: /etc/hosts に自ホスト名を登録
+          ansible.builtin.lineinfile:
+            path: /etc/hosts
+            regexp: '^{{ node_ip | regex_escape }}\s'
+            line: "{{ node_ip }} {{ ansible_nodename }} {{ ansible_hostname }}"
+
+        - name: firewalld の稼働確認
+          ansible.builtin.command: systemctl is-active firewalld
+          register: firewalld_state
+          changed_when: false
+          failed_when: false
+
+        - name: firewalld でポートを開放
+          ansible.builtin.command: firewall-cmd --permanent --add-port={{ item }}
+          loop: "{{ firewall_ports }}"
+          register: fw_port
+          changed_when: "'ALREADY_ENABLED' not in fw_port.stderr"
+          when: firewalld_state.stdout == "active"
+          notify: reload firewalld
+
+        - name: firewalld でサービスを開放
+          ansible.builtin.command: firewall-cmd --permanent --add-service={{ item }}
+          loop: "{{ firewall_services }}"
+          register: fw_svc
+          changed_when: "'ALREADY_ENABLED' not in fw_svc.stderr"
+          when: firewalld_state.stdout == "active"
+          notify: reload firewalld
+
+    - name: Apply firewall changes now
+      ansible.builtin.meta: flush_handlers
+      tags: [base]
+
+    # =================================================================
+    # 2. Podman（cephadm と compose スタックの両方で使う / rootful）
+    # =================================================================
+    - name: Podman
+      tags: [podman]
+      block:
+        - name: Docker CE が入っていると競合するので確認
+          ansible.builtin.command: rpm -q docker-ce
+          register: docker_ce_rpm
+          changed_when: false
+          failed_when: false
+
+        - name: Docker CE が入っている場合は中断
+          ansible.builtin.fail:
+            msg: >-
+              docker-ce がインストールされています。podman 版を使う場合は
+              'sudo dnf remove docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin'
+              で削除してから再実行してください。
+          when: docker_ce_rpm.rc == 0
+
+        - name: Podman 関連パッケージをインストール
+          ansible.builtin.dnf:
+            name:
+              - podman
+              - netavark
+              - aardvark-dns      # コンテナ名での名前解決（postgres / hive-metastore など）
+              - container-selinux
+            state: present
+
+        - name: podman.socket（Docker 互換 API）と podman-restart（OS 起動時の自動再起動）を有効化
+          ansible.builtin.systemd_service:
+            name: "{{ item.name }}"
+            enabled: true
+            state: "{{ item.state | default(omit) }}"
+          loop:
+            - { name: podman.socket, state: started }
+            - { name: podman-restart.service }   # 起動時のみ動けばよいので enable だけ
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: compose プロバイダ配置先 / containers.conf.d ディレクトリを作成
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - /usr/libexec/docker/cli-plugins
+            - /etc/containers/containers.conf.d
+
+        - name: docker-compose v2 バイナリを取得（podman compose の実行エンジンとして使用）
+          ansible.builtin.get_url:
+            url: >-
+              {{ 'https://github.com/docker/compose/releases/latest/download'
+                 if docker_compose_version == 'latest'
+                 else 'https://github.com/docker/compose/releases/download/' ~ docker_compose_version }}/docker-compose-linux-{{ ansible_architecture }}
+            dest: /usr/libexec/docker/cli-plugins/docker-compose
+            mode: "0755"
+
+        - name: /usr/local/bin からも呼べるようにリンク
+          ansible.builtin.file:
+            src: /usr/libexec/docker/cli-plugins/docker-compose
+            dest: /usr/local/bin/docker-compose
+            state: link
+
+        - name: podman compose が使うプロバイダを固定し、毎回の警告表示を抑止
+          ansible.builtin.copy:
+            dest: /etc/containers/containers.conf.d/50-compose.conf
+            mode: "0644"
+            content: |
+              [engine]
+              compose_providers = ["/usr/libexec/docker/cli-plugins/docker-compose"]
+              compose_warning_logs = false
+
+        - name: Podman の動作確認
+          ansible.builtin.command: podman compose version
+          changed_when: false
+
+    # =================================================================
+    # 3. Ceph（cephadm でシングルノード構築 + RGW）
+    # =================================================================
+    - name: Ceph
+      tags: [ceph]
+      block:
+        - name: cephadm を取得
+          ansible.builtin.get_url:
+            url: "https://download.ceph.com/rpm-{{ ceph_release }}/el9/noarch/cephadm"
+            dest: /usr/local/sbin/cephadm
+            mode: "0755"
+
+        - name: sudo の PATH（secure_path）からも呼べるようにリンク
+          ansible.builtin.file:
+            src: /usr/local/sbin/cephadm
+            dest: /usr/sbin/cephadm
+            state: link
+
+        - name: 既存クラスタの有無を確認
+          ansible.builtin.stat:
+            path: /etc/ceph/ceph.conf
+          register: ceph_conf
+
+        - name: cephadm bootstrap（シングルホスト）
+          ansible.builtin.command: >-
+            /usr/local/sbin/cephadm bootstrap
+            --mon-ip {{ node_ip }}
+            --single-host-defaults
+            --skip-monitoring-stack
+            --allow-fqdn-hostname
+            --initial-dashboard-user {{ ceph_dashboard_user }}
+            --initial-dashboard-password {{ ceph_dashboard_password }}
+            --dashboard-password-noupdate
+          when: not ceph_conf.stat.exists
+
+        - name: 検証用にメモリ使用量などを調整
+          ansible.builtin.shell:
+            cmd: |
+              {{ ceph_shell }} bash -c '
+                ceph config set osd osd_memory_target_autotune false
+                ceph config set osd osd_memory_target {{ ceph_osd_memory_target }}
+                ceph config set mgr mgr/cephadm/autotune_memory_target_ratio 0.2
+              '
+          changed_when: false
+
+        - name: OSD 1 本構成の場合はレプリカ 1 を許可
+          ansible.builtin.shell:
+            cmd: |
+              {{ ceph_shell }} bash -c '
+                ceph config set global mon_allow_pool_size_one true
+                ceph config set global osd_pool_default_size 1
+                ceph config set global osd_pool_default_min_size 1
+                ceph config set global mon_warn_on_pool_no_redundancy false
+              '
+          changed_when: false
+          when: osd_devices | length == 1
+
+        - name: OSD サービス定義を配置
+          ansible.builtin.template:
+            src: osd_spec.yml.j2
+            dest: /etc/ceph/osd_spec.yml
+            mode: "0644"
+
+        - name: OSD を作成（宣言的なので再実行しても安全）
+          ansible.builtin.command: >-
+            /usr/local/sbin/cephadm shell
+            --mount /etc/ceph/osd_spec.yml:/mnt/osd_spec.yml
+            -- ceph orch apply -i /mnt/osd_spec.yml
+          changed_when: false
+
+        - name: OSD が全て up になるまで待機（最大 10 分）
+          ansible.builtin.shell:
+            cmd: "{{ ceph_shell }} ceph osd stat -f json 2>/dev/null | tail -n 1"
+          register: osd_stat
+          until: >-
+            osd_stat.rc == 0 and
+            (osd_stat.stdout | from_json).num_up_osds | int >= osd_devices | length
+          retries: 60
+          delay: 10
+          changed_when: false
+
+        - name: RGW（S3 互換ゲートウェイ）をデプロイ
+          ansible.builtin.command: >-
+            {{ ceph_shell }} ceph orch apply rgw {{ rgw_service_id }}
+            --placement="1 {{ ansible_nodename }}"
+            --port={{ rgw_port }}
+          changed_when: false
+
+        - name: RGW のポートが開くまで待機
+          ansible.builtin.wait_for:
+            host: "{{ node_ip }}"
+            port: "{{ rgw_port }}"
+            timeout: 900
+
+        - name: OSD 1 本構成の場合、既存プールもレプリカ 1 に変更
+          ansible.builtin.shell:
+            cmd: |
+              {{ ceph_shell }} bash -c '
+                for p in $(ceph osd pool ls); do
+                  ceph osd pool set "$p" size 1 --yes-i-really-mean-it
+                  ceph osd pool set "$p" min_size 1
+                done
+              '
+          changed_when: false
+          when: osd_devices | length == 1
+
+        - name: RGW ユーザーの有無を確認
+          ansible.builtin.command: "{{ ceph_shell }} radosgw-admin user info --uid={{ rgw_service_id }}"
+          register: rgw_user
+          failed_when: false
+          changed_when: false
+
+        - name: RGW ユーザーを作成（S3 アクセスキーを固定値で発行）
+          ansible.builtin.command: >-
+            {{ ceph_shell }} radosgw-admin user create
+            --uid={{ rgw_service_id }}
+            --display-name="Iceberg"
+            --access-key={{ s3_access_key }}
+            --secret-key={{ s3_secret_key }}
+          when: rgw_user.rc != 0
+
+    # =================================================================
+    # 4. podman compose スタック（PostgreSQL / HMS / Trino）
+    # =================================================================
+    - name: Compose stack
+      tags: [stack]
+      block:
+        - name: ディレクトリ作成
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ stack_dir }}"
+            - "{{ stack_dir }}/hive/conf"
+            - "{{ stack_dir }}/hive/lib"
+            - "{{ stack_dir }}/trino/catalog"
+
+        - name: docker-compose.yml を配置
+          ansible.builtin.copy:
+            src: docker-compose.yml
+            dest: "{{ stack_dir }}/docker-compose.yml"
+            mode: "0644"
+
+        - name: .env を配置（認証情報を含むため 0600）
+          ansible.builtin.template:
+            src: env.j2
+            dest: "{{ stack_dir }}/.env"
+            mode: "0600"
+
+        - name: Hive Metastore 設定を配置
+          ansible.builtin.template:
+            src: "{{ item }}.j2"
+            dest: "{{ stack_dir }}/hive/conf/{{ item }}"
+            mode: "0644"
+          loop: [hive-site.xml, core-site.xml]
+
+        - name: Trino カタログ設定を配置
+          ansible.builtin.template:
+            src: "{{ item }}.j2"
+            dest: "{{ stack_dir }}/trino/catalog/{{ item }}"
+            mode: "0644"
+          loop: [iceberg.properties, tpch.properties]
+
+        - name: HMS 用 JAR を取得（S3A + PostgreSQL JDBC）
+          ansible.builtin.get_url:
+            url: "{{ item.url }}"
+            dest: "{{ stack_dir }}/hive/lib/{{ item.name }}"
+            mode: "0644"
+          loop:
+            - name: hadoop-aws.jar
+              url: "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/{{ hadoop_aws_version }}/hadoop-aws-{{ hadoop_aws_version }}.jar"
+            - name: aws-java-sdk-bundle.jar
+              url: "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/{{ aws_sdk_bundle_version }}/aws-java-sdk-bundle-{{ aws_sdk_bundle_version }}.jar"
+            - name: postgresql.jar
+              url: "https://repo1.maven.org/maven2/org/postgresql/postgresql/{{ postgres_jdbc_version }}/postgresql-{{ postgres_jdbc_version }}.jar"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: podman compose up
+          ansible.builtin.command: podman compose up -d
+          args:
+            chdir: "{{ stack_dir }}"
+          register: compose_up
+          changed_when: >-
+            'Started' in compose_up.stderr or
+            'Created' in compose_up.stderr or
+            'Recreated' in compose_up.stderr
+
+        - name: Hive Metastore の起動待ち
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: 9083
+            timeout: 600
+
+        - name: Trino の起動待ち
+          ansible.builtin.uri:
+            url: http://127.0.0.1:8080/v1/info
+            return_content: true
+          register: trino_info
+          until: trino_info.status == 200 and not trino_info.json.starting
+          retries: 60
+          delay: 5
+
+    # =================================================================
+    # 5. PyIceberg（ホストの venv）
+    # =================================================================
+    - name: PyIceberg
+      tags: [pyiceberg]
+      block:
+        - name: PyIceberg を venv にインストール
+          ansible.builtin.pip:
+            name: "{{ pyiceberg_spec }}"
+            virtualenv: "{{ pyiceberg_venv }}"
+            virtualenv_command: python3 -m venv
+
+        - name: ユーザーのホームディレクトリを取得
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ app_user }}"
+
+        - name: ~/.pyiceberg.yaml を配置
+          ansible.builtin.template:
+            src: pyiceberg.yaml.j2
+            dest: "{{ getent_passwd[app_user][4] }}/.pyiceberg.yaml"
+            owner: "{{ app_user }}"
+            mode: "0600"
+
+        - name: サンプルを配置
+          ansible.builtin.copy:
+            src: samples/
+            dest: "{{ getent_passwd[app_user][4] }}/dataplatform-samples/"
+            owner: "{{ app_user }}"
+            mode: "0644"
+
+    # =================================================================
+    # 6. 疎通確認
+    # =================================================================
+    - name: Smoke test
+      tags: [test]
+      block:
+        - name: Ceph の状態
+          ansible.builtin.command: "{{ ceph_shell }} ceph -s"
+          register: ceph_status
+          changed_when: false
+
+        - name: Trino から Iceberg カタログが見えるか
+          ansible.builtin.command: >-
+            podman exec trino
+            trino --execute "SHOW CATALOGS; SHOW SCHEMAS FROM iceberg"
+          register: trino_check
+          changed_when: false
+
+        - name: 結果表示
+          ansible.builtin.debug:
+            msg:
+              - "{{ ceph_status.stdout_lines }}"
+              - "{{ trino_check.stdout_lines }}"
+              - "Trino UI      : http://{{ node_ip }}:8080 (ユーザー名は任意)"
+              - "Ceph Dashboard: https://{{ node_ip }}:8443 ({{ ceph_dashboard_user }})"
+              - "S3 endpoint   : http://{{ node_ip }}:{{ rgw_port }}"
+
+  handlers:
+    - name: reload firewalld
+      ansible.builtin.command: firewall-cmd --reload
+      changed_when: true

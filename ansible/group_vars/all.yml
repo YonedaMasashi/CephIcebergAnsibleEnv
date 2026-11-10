@@ -1,0 +1,66 @@
+---
+# =====================================================================
+#  必ず環境に合わせて変更する項目
+# =====================================================================
+
+# VM の固定 IP（VirtualBox のホストオンリーアダプタ側の IP を推奨）
+# Ceph MON / RGW はこの IP で待ち受け、コンテナからもこの IP で RGW に接続する
+node_ip: "192.168.56.10"
+
+# Ceph OSD に使う「未フォーマットの空ディスク」
+# VirtualBox で VM に追加したディスク。lsblk で名前を確認すること
+#   - 3 本: 推奨（レプリカ 2 で HEALTH_OK になる）
+#   - 1 本: 可（自動的にレプリカ 1 に設定。データ冗長性なし）
+osd_devices:
+  - /dev/sdb
+  - /dev/sdc
+  - /dev/sdd
+
+# =====================================================================
+#  必要に応じて変更する項目
+# =====================================================================
+
+# PyIceberg 設定ファイル・サンプルの配置先ユーザー
+app_user: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+
+# --- Ceph ---
+ceph_release: tentacle            # Ceph 20.x
+ceph_dashboard_user: admin
+ceph_dashboard_password: "ChangeMe_Ceph123!"
+ceph_osd_memory_target: 1073741824   # OSD 1 本あたり 1GiB（検証用に小さく）
+rgw_service_id: iceberg
+rgw_port: 7480
+
+# --- S3 (Ceph RGW) 認証情報 ---
+# アクセスキー: 20 文字 / シークレット: 40 文字程度
+s3_access_key: "ICEBERGACCESSKEY0001"
+s3_secret_key: "IcebergSecretKeyChangeMe0123456789abcdef"
+s3_region: us-east-1
+warehouse_bucket: warehouse
+
+# --- Podman / compose ---
+# podman compose が内部で使う docker-compose v2 バイナリのバージョン
+#   "latest" か、固定したい場合は "v2.40.3" のようなタグ名
+docker_compose_version: latest
+
+# --- compose スタック ---
+stack_dir: /opt/dataplatform
+postgres_version: "17"
+postgres_db: metastore_db
+postgres_user: hive
+postgres_password: "ChangeMe_Hive123"
+
+# apache/hive イメージ（同梱 Hadoop 3.3.6）
+# 4.0.1 以降は Thrift API の get_table が削除されており、
+# get_table_req 未対応の PyIceberg から load_table できないため 4.0.0 を使う
+hive_version: "4.0.0"
+hadoop_aws_version: "3.3.6"        # ↑の Hadoop バージョンと必ず一致させる
+aws_sdk_bundle_version: "1.12.367" # Hadoop 3.3.6 が依存する AWS SDK v1
+postgres_jdbc_version: "42.7.4"
+
+trino_version: "482"
+trino_mem_limit: "4g"              # Trino コンテナのメモリ上限（JVM はこの 80% を使用）
+
+# --- PyIceberg ---
+pyiceberg_venv: /opt/pyiceberg
+pyiceberg_spec: "pyiceberg[hive,pyarrow,pandas]"

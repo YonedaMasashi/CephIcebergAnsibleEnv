@@ -1,0 +1,13 @@
+# Trino Iceberg カタログ（カタログ実装 = Hive Metastore, ストレージ = Ceph RGW）
+connector.name=iceberg
+iceberg.catalog.type=hive_metastore
+hive.metastore.uri=thrift://hive-metastore:9083
+iceberg.file-format=PARQUET
+
+# --- Native S3 file system → Ceph RGW ---
+fs.native-s3.enabled=true
+s3.endpoint=http://{{ node_ip }}:{{ rgw_port }}
+s3.region={{ s3_region }}
+s3.path-style-access=true
+s3.aws-access-key={{ s3_access_key }}
+s3.aws-secret-key={{ s3_secret_key }}
